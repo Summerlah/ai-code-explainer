@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 import httpx
 from google.genai import errors
 
-from ai.gemini import GeminiError, _client, _generate, generate_test_cases
+from ai.gemini import MODEL, GeminiError, _client, _generate, generate_test_cases
 
 
 class GeminiTestCaseValidationTests(unittest.TestCase):
@@ -25,6 +25,25 @@ class GeminiTestCaseValidationTests(unittest.TestCase):
         make_client.assert_called_once()
         self.assertEqual(make_client.call_args.kwargs["api_key"], "cloud-secret")
         read_secret.assert_called_once_with()
+
+    @patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"})
+    @patch("ai.gemini.genai.Client")
+    def test_creates_and_closes_a_client_for_each_generation(
+        self, make_client: Mock
+    ) -> None:
+        clients = [Mock(), Mock()]
+        for client in clients:
+            client.__enter__ = Mock(return_value=client)
+            client.__exit__ = Mock(return_value=False)
+            client.models.generate_content.return_value.text = "response"
+        make_client.side_effect = clients
+
+        self.assertEqual(_generate("first prompt"), "response")
+        self.assertEqual(_generate("second prompt"), "response")
+
+        self.assertEqual(make_client.call_count, 2)
+        for client in clients:
+            client.__exit__.assert_called_once()
 
     @patch("ai.gemini._generate")
     def test_accepts_valid_json_test_cases(self, generate: Mock) -> None:
@@ -59,21 +78,43 @@ class GeminiTestCaseValidationTests(unittest.TestCase):
     @patch("ai.gemini._client")
     def test_handles_empty_responses(self, make_client: Mock) -> None:
         client = Mock()
+        client.__enter__ = Mock(return_value=client)
+        client.__exit__ = Mock(return_value=False)
         client.models.generate_content.return_value.text = " "
         make_client.return_value = client
 
         with self.assertRaisesRegex(GeminiError, "empty response"):
             _generate("prompt")
+        client.__exit__.assert_called_once()
 
     @patch("ai.gemini._client")
     def test_requests_structured_json_response(self, make_client: Mock) -> None:
         client = Mock()
+        client.__enter__ = Mock(return_value=client)
+        client.__exit__ = Mock(return_value=False)
         client.models.generate_content.return_value.text = "[]"
         make_client.return_value = client
 
         self.assertEqual(_generate("prompt", json_response=True), "[]")
-        config = client.models.generate_content.call_args.kwargs["config"]
+        request = client.models.generate_content.call_args.kwargs
+        config = request["config"]
+        self.assertEqual(request["model"], MODEL)
         self.assertEqual(config.response_mime_type, "application/json")
+        client.__exit__.assert_called_once()
+
+    @patch("ai.gemini._client")
+    def test_handles_closed_client_errors(self, make_client: Mock) -> None:
+        client = Mock()
+        client.__enter__ = Mock(return_value=client)
+        client.__exit__ = Mock(return_value=False)
+        client.models.generate_content.side_effect = RuntimeError(
+            "Cannot send a request, as the client has been closed."
+        )
+        make_client.return_value = client
+
+        with self.assertRaisesRegex(GeminiError, "closed before the request"):
+            _generate("prompt")
+        client.__exit__.assert_called_once()
 
     @patch("ai.gemini._client")
     def test_handles_rate_limits(self, make_client: Mock) -> None:
@@ -83,6 +124,16 @@ class GeminiTestCaseValidationTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(GeminiError, "rate or usage limits"):
+            _generate("prompt")
+
+    @patch("ai.gemini._client")
+    def test_handles_unavailable_models(self, make_client: Mock) -> None:
+        make_client.side_effect = errors.APIError(
+            code=404,
+            response_json={"error": {"message": "model not found"}},
+        )
+
+        with self.assertRaisesRegex(GeminiError, "model.*unavailable"):
             _generate("prompt")
 
     @patch("ai.gemini._client")

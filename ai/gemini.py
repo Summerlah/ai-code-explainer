@@ -8,7 +8,7 @@ from google import genai
 from google.genai import errors, types
 
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.8-flash"
 REQUEST_TIMEOUT_MS = 30_000
 
 
@@ -43,17 +43,23 @@ def _generate(prompt: str, *, json_response: bool = False) -> str:
         else None
     )
     try:
-        response = _client().models.generate_content(
-            model=MODEL,
-            contents=prompt,
-            config=config,
-        )
+        with _client() as client:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+                config=config,
+            )
     except errors.APIError as error:
         status = getattr(error, "code", None)
         if status in (401, 403):
             message = "Gemini rejected the API key or its permissions. Check your Google AI access."
         elif status == 429:
             message = "Gemini rate or usage limits were reached. Wait and try again."
+        elif status == 404:
+            message = (
+                f"The configured Gemini model ({MODEL}) is unavailable for this API key. "
+                "Check model availability and API access."
+            )
         elif status in (503, 504):
             message = "Gemini is temporarily unavailable. Please try again shortly."
         else:
@@ -65,7 +71,15 @@ def _generate(prompt: str, *, json_response: bool = False) -> str:
         TimeoutError,
         ConnectionError,
     ) as error:
-        raise GeminiError("The Gemini request timed out or could not connect. Please try again.") from error
+        raise GeminiError(
+            "The Gemini request timed out or could not connect. Please try again."
+        ) from error
+    except RuntimeError as error:
+        if "client has been closed" not in str(error).lower():
+            raise
+        raise GeminiError(
+            "The Gemini client was closed before the request completed. Please try again."
+        ) from error
 
     text = response.text
     if not text or not text.strip():
